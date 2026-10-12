@@ -68,7 +68,8 @@ def build_metadata(data_root: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def assign_split(meta: pd.DataFrame, val_frac: float, test_frac: float, seed: int) -> pd.Series:
+def assign_split(meta: pd.DataFrame, val_frac: float, test_frac: float, seed: int,
+                 verbose: bool = True) -> pd.Series:
     """Split by patient, stratified by subtype, with at least one patient per subtype in val and test.
 
     The split is decided per patient, so every image of a patient (all magnifications)
@@ -86,7 +87,7 @@ def assign_split(meta: pd.DataFrame, val_frac: float, test_frac: float, seed: in
         n = len(patients)
         n_test = max(1, round(test_frac * n))
         n_val = max(1, round(val_frac * n))
-        if n_test + n_val >= n:
+        if verbose and n_test + n_val >= n:
             print(f"WARNING: subtype {subtype} has only {n} patients; train gets {n - n_test - n_val}")
         for p in patients[:n_test]:
             assignment[p] = "test"
@@ -95,6 +96,29 @@ def assign_split(meta: pd.DataFrame, val_frac: float, test_frac: float, seed: in
         for p in patients[n_test + n_val:]:
             assignment[p] = "train"
     return meta["patient_id"].map(assignment)
+
+
+def split_imbalance(meta: pd.DataFrame, split: pd.Series, val_frac: float, test_frac: float) -> float:
+    """How far each subtype's share of IMAGES in train/val/test is from the target fractions.
+
+    Patients contribute very different numbers of images, so a patient-level split can leave
+    a subtype with few training images. Lower is better. Uses only labels and counts,
+    never model results, so choosing a seed with it does not leak test information.
+    """
+    target = {"train": 1 - val_frac - test_frac, "val": val_frac, "test": test_frac}
+    shares = pd.crosstab(meta["subtype"], split, normalize="index")
+    return float(sum(((shares.get(s, 0) - t) ** 2).sum() for s, t in target.items()))
+
+
+def choose_seed(meta: pd.DataFrame, val_frac: float, test_frac: float, n_seeds: int) -> int:
+    scores = {}
+    for seed in range(n_seeds):
+        split = assign_split(meta, val_frac, test_frac, seed, verbose=False)
+        scores[seed] = split_imbalance(meta, split, val_frac, test_frac)
+    best = min(scores, key=scores.get)
+    print(f"Searched {n_seeds} seeds; best seed = {best} "
+          f"(imbalance {scores[best]:.3f}; seed 42 would be {scores.get(42, float('nan')):.3f})")
+    return best
 
 
 def run_checks(meta: pd.DataFrame) -> None:
@@ -137,6 +161,9 @@ def main():
     parser.add_argument("--val_frac", type=float, default=0.2)
     parser.add_argument("--test_frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--search_seeds", type=int, default=0,
+                        help="Try seeds 0..N-1 and keep the one whose per-subtype IMAGE shares are "
+                             "closest to the target fractions (overrides --seed)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Allow replacing an existing metadata.csv (the split must stay frozen!)")
     args = parser.parse_args()
@@ -146,10 +173,18 @@ def main():
         sys.exit(f"{out} already exists. The split is frozen; use --overwrite only if the team agreed.")
 
     meta = build_metadata(Path(args.data_root))
-    meta["split"] = assign_split(meta, args.val_frac, args.test_frac, args.seed)
+    seed = args.seed
+    if args.search_seeds > 0:
+        seed = choose_seed(meta, args.val_frac, args.test_frac, args.search_seeds)
+    meta["split"] = assign_split(meta, args.val_frac, args.test_frac, seed)
 
     run_checks(meta)
     print_split_tables(meta)
+    print("\n=== Share of each subtype's images in train (target "
+          f"{1 - args.val_frac - args.test_frac:.0%}) ===")
+    print((pd.crosstab(meta["subtype_name"], meta["split"], normalize="index")["train"] * 100)
+          .round(0).astype(int).astype(str).add("%").to_string())
+    print(f"\nSeed used: {seed}")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     meta.to_csv(out, index=False)
